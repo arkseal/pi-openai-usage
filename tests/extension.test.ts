@@ -7,7 +7,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import openaiUsageExtension from "../index.ts";
 
 const TOKEN = "test-access-token-never-to-be-exposed";
-const g = globalThis as unknown as { __PI_SIDEBAR_PANELS__?: Map<string, any> };
+const g = globalThis as unknown as {
+  __PI_SIDEBAR_PANELS__?: Map<string, any>;
+  __PI_SIDEBAR_REQUEST_RENDER__?: () => void;
+};
 let originalAgentDir: string | undefined;
 let originalFetch: typeof fetch;
 let agentDir: string;
@@ -37,6 +40,7 @@ afterEach(() => {
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   delete g.__PI_SIDEBAR_PANELS__;
+  delete g.__PI_SIDEBAR_REQUEST_RENDER__;
   rmSync(agentDir, { recursive: true, force: true });
 });
 
@@ -178,6 +182,20 @@ test("a command finishing after shutdown does not use its expired UI context", a
   await command;
   assert.equal(h.reports.length, 0);
   finish(new Response("{}"));
+});
+
+test("a broken sidebar repaint hook cannot break startup, footer updates, or shutdown", async () => {
+  g.__PI_SIDEBAR_REQUEST_RENDER__ = () => { throw new Error("sidebar unavailable"); };
+  const h = harness();
+  assert.doesNotThrow(() => h.events.get("session_start")!({}, h.ctx));
+  await h.commands.get("openai-usage").handler("status", h.ctx);
+  assert.match(h.statuses.get("openai-usage")!, /OpenAI left: 5h 75%/);
+  const result = await h.tools.get("openai_usage").execute("call", {}, new AbortController().signal);
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /75%/);
+  assert.doesNotThrow(() => h.events.get("session_shutdown")!({}, h.ctx));
+  assert.equal(g.__PI_SIDEBAR_PANELS__?.has("openai-usage"), false);
+  assert.equal(h.statuses.get("openai-usage"), undefined);
 });
 
 test("invalid command arguments and non-TUI footer requests are handled", async () => {

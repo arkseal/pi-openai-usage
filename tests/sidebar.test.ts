@@ -57,6 +57,33 @@ test("shutdown from an old runtime cannot unregister a new replacement", () => {
   assert.equal(g.__PI_SIDEBAR_PANELS__?.has(PANEL_ID), false);
 });
 
+test("throwing repaint hooks do not interrupt panel registration or disposal", () => {
+  for (const modern of [false, true]) {
+    const requestRender = () => { throw new Error("sidebar was torn down"); };
+    if (modern) g.__PI_SIDEBAR_TUI__ = { requestRender };
+    else g.__PI_SIDEBAR_REQUEST_RENDER__ = requestRender;
+    const unregister = registerUsagePanel(() => ["usage"]);
+    assert.ok(g.__PI_SIDEBAR_PANELS__?.has(PANEL_ID));
+    assert.doesNotThrow(requestSidebarRender);
+    assert.doesNotThrow(unregister);
+    assert.equal(g.__PI_SIDEBAR_PANELS__?.has(PANEL_ID), false);
+    delete g.__PI_SIDEBAR_TUI__;
+    delete g.__PI_SIDEBAR_REQUEST_RENDER__;
+  }
+});
+
+test("async repaint failures are observed rather than escaping as unhandled rejections", async () => {
+  for (const modern of [false, true]) {
+    const requestRender = async () => { throw new Error("async sidebar failure"); };
+    if (modern) g.__PI_SIDEBAR_TUI__ = { requestRender };
+    else g.__PI_SIDEBAR_REQUEST_RENDER__ = requestRender;
+    requestSidebarRender();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    delete g.__PI_SIDEBAR_TUI__;
+    delete g.__PI_SIDEBAR_REQUEST_RENDER__;
+  }
+});
+
 test("registration does not remove other providers' panels", () => {
   g.__PI_SIDEBAR_PANELS__ = new Map([["antigravity-quota", { id: "antigravity-quota" }]]);
   const unregister = registerUsagePanel(() => []);

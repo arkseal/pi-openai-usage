@@ -22,11 +22,14 @@ function globals(): SidebarGlobals {
 
 export function requestSidebarRender(): void {
   const g = globals();
-  if (typeof g.__PI_SIDEBAR_TUI__?.requestRender === "function") {
-    g.__PI_SIDEBAR_TUI__.requestRender();
-  } else {
-    g.__PI_SIDEBAR_REQUEST_RENDER__?.();
-  }
+  // This hook belongs to another extension and may already be torn down.
+  // Repainting must not interrupt panel registration/removal or status updates.
+  try {
+    const result = typeof g.__PI_SIDEBAR_TUI__?.requestRender === "function"
+      ? g.__PI_SIDEBAR_TUI__.requestRender()
+      : g.__PI_SIDEBAR_REQUEST_RENDER__?.();
+    void Promise.resolve(result).catch(() => {});
+  } catch { /* Best-effort repaint. */ }
 }
 
 /** Use the same load-order-independent protocol as pi-antigravity-auth. */
