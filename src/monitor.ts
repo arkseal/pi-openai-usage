@@ -5,7 +5,7 @@ export const RENDER_INTERVAL_MS = 15_000;
 
 export interface MonitorOptions {
   load: (signal: AbortSignal) => Promise<UsageSnapshot>;
-  onChange?: (state: UsageState) => void;
+  onChange?: (state: UsageState) => void | Promise<void>;
   now?: () => number;
   refreshIntervalMs?: number;
   renderIntervalMs?: number;
@@ -15,6 +15,7 @@ export interface MonitorOptions {
 export class UsageMonitor {
   private state: UsageState = { loading: false };
   private inFlight?: Promise<UsageState>;
+  private cancelWait?: () => void;
   private controller?: AbortController;
   private timer?: ReturnType<typeof setInterval>;
   private lastAttempt = -Infinity;
@@ -35,12 +36,21 @@ export class UsageMonitor {
   }
 
   private changed(): void {
-    this.options.onChange?.(this.state);
+    // Rendering is best-effort: an unavailable UI must not fail a lookup,
+    // wedge single-flight bookkeeping, or reject a fire-and-forget refresh.
+    try {
+      void Promise.resolve(this.options.onChange?.(this.state)).catch(() => {});
+    } catch { /* Observer failures are not usage/network failures. */ }
   }
 
   start(poll = true): void {
     this.stopped = false;
-    if (!poll || this.timer) return;
+    if (!poll) {
+      if (this.timer) clearInterval(this.timer);
+      this.timer = undefined;
+      return;
+    }
+    if (this.timer) return;
     this.timer = setInterval(() => {
       void this.refresh();
       this.changed(); // Repaint reset countdowns, even when the cache is fresh.
@@ -62,9 +72,13 @@ export class UsageMonitor {
     this.controller = controller;
     this.lastAttempt = this.now();
     this.state = { ...this.state, loading: true };
-    this.changed();
+    // stop() settles callers even if an injected loader ignores cancellation.
+    // The work remains observed and generation-guarded until it eventually ends.
+    const cancelled = new Promise<UsageState>((resolve) => {
+      this.cancelWait = () => resolve(cancelledState);
+    });
 
-    this.inFlight = (async () => {
+    const work = (async () => {
       // Yield before invoking an injected loader that might throw synchronously.
       await Promise.resolve();
       try {
@@ -83,12 +97,19 @@ export class UsageMonitor {
         if (generation === this.generation) {
           this.controller = undefined;
           this.inFlight = undefined;
-          this.changed();
+          this.cancelWait = undefined;
         }
       }
-      return this.state;
+      // Preserve this refresh's result if an observer starts another refresh.
+      const result = this.state;
+      this.changed();
+      return result;
     })();
-    return this.inFlight;
+    const pending = Promise.race([work, cancelled]);
+    this.inFlight = pending;
+    // Publish single-flight before calling observers, which can reenter or stop.
+    this.changed();
+    return pending;
   }
 
   stop(): void {
@@ -97,6 +118,8 @@ export class UsageMonitor {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.controller?.abort();
+    this.cancelWait?.();
+    this.cancelWait = undefined;
     this.controller = undefined;
     this.inFlight = undefined;
     this.lastAttempt = -Infinity;
