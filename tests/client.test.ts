@@ -502,6 +502,22 @@ describe("fetchUsage", () => {
     });
   });
 
+  it("disposes a response when abort races between fetch resolution and continuation", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+    await assert.rejects(fetchUsage(credentials, {
+      signal: controller.signal,
+      fetch: async () => {
+        // The response arrives before abort, but the fetch waiter resumes after it.
+        queueMicrotask(() => queueMicrotask(() => controller.abort()));
+        return new Response(body);
+      },
+    }), /aborted/);
+    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
+  });
+
   it("disposes a late response from a transport that ignored cancellation", async () => {
     let finish!: (response: Response) => void;
     const controller = new AbortController();

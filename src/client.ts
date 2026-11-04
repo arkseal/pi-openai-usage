@@ -224,6 +224,7 @@ export async function fetchUsage(
     timedOut = true;
     controller.abort();
   }, timeoutMs);
+  let receivedResponse: Response | undefined;
   const failure = (fallback: string): Error => new Error(
     timedOut ? `OpenAI usage request timed out after ${timeoutMs}ms`
       : options?.signal?.aborted ? "OpenAI usage request was aborted" : fallback,
@@ -243,6 +244,7 @@ export async function fetchUsage(
         const result = await fetchFn(USAGE_URL, {
           method: "GET", headers, redirect: "error", signal,
         });
+        receivedResponse = result;
         // A non-cooperative transport can resolve after our caller has left.
         if (signal.aborted) cancelBody(result);
         return result;
@@ -278,5 +280,8 @@ export async function fetchUsage(
     clearTimeout(timer);
     // Stop the underlying transport too, including on body-size/parse failures.
     controller.abort();
+    // Also cover aborts between fetch resolution and the awaiting continuation.
+    // Completed bodies are unlocked/closed, so cancellation is harmless there.
+    if (receivedResponse) cancelBody(receivedResponse);
   }
 }
