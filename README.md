@@ -59,7 +59,7 @@ OpenAI's usage endpoint is an internal ChatGPT API. Native direct-API grants (`c
 
 - Interactive TUI sessions fetch immediately and poll at most once per minute. Reset countdowns repaint every 15 seconds.
 - OpenAI turn completion and model selection reuse the same throttled refresh. Explicit commands and tools bypass the cache interval; concurrent checks share one request.
-- Requests have a 15-second deadline, including response-body parsing, and are aborted at session shutdown. Redirects are rejected.
+- Requests have a 15-second deadline, including response-body parsing, and are aborted at session shutdown. Response bodies are limited to 1 MiB of decoded bytes, independent of `Content-Length`; incomplete bodies are cancelled on failure or abort. Redirects are rejected.
 - Gauges are aligned and theme-aware: green above 50% remaining, amber at 20–50%, red below 20%. Narrow terminals omit reset suffixes.
 - Windows are labeled by their actual duration, so a weekly-only response is not mislabeled as a 5-hour quota. Missing windows are omitted, not displayed as 100% available.
 - On a transient failure, last-known usage is kept and explicitly marked **stale**. A reset countdown reaching zero displays **Due** until fresh data confirms the new quota.

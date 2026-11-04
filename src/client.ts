@@ -1,6 +1,9 @@
 import type { UsageAccount, UsageCredentials, UsageSnapshot, UsageWindow } from "./types.ts";
 
 export const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+// The endpoint normally returns a few KiB. Bound decoded bytes, not Content-Length
+// (which may be absent, incorrect, or refer to a compressed representation).
+export const MAX_USAGE_RESPONSE_BYTES = 1024 * 1024;
 
 export function formatWindowDuration(seconds: number): { id: string; label: string } {
   if (seconds === 18000) {
@@ -145,7 +148,7 @@ export function parseUsageResponse(
 function withAbort<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
-    const aborted = () => reject(signal.reason);
+    const aborted = () => { cleanup(); reject(signal.reason); };
     const cleanup = () => signal.removeEventListener("abort", aborted);
     signal.addEventListener("abort", aborted, { once: true });
     try {
@@ -158,6 +161,39 @@ function withAbort<T>(operation: () => Promise<T>, signal: AbortSignal): Promise
       reject(error);
     }
   });
+}
+
+function cancelBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => {});
+  } catch { /* Best-effort cleanup; never expose upstream errors. */ }
+}
+
+class ResponseTooLargeError extends Error {}
+
+async function readUsageJson(response: Response, signal: AbortSignal): Promise<unknown> {
+  if (!response.body) throw new Error("Missing response body");
+  const reader = response.body.getReader();
+  const bytes = new Uint8Array(MAX_USAGE_RESPONSE_BYTES);
+  let size = 0;
+  let complete = false;
+  try {
+    while (true) {
+      const { done, value } = await withAbort(() => reader.read(), signal);
+      signal.throwIfAborted();
+      if (done) { complete = true; break; }
+      if (value.byteLength > MAX_USAGE_RESPONSE_BYTES - size) throw new ResponseTooLargeError();
+      bytes.set(value, size);
+      size += value.byteLength;
+    }
+    return JSON.parse(new TextDecoder().decode(bytes.subarray(0, size)));
+  } finally {
+    if (!complete) {
+      // Cancellation can itself stall. Do not await it or retain the reader lock.
+      try { void reader.cancel().catch(() => {}); } catch { /* Best effort. */ }
+    }
+    reader.releaseLock();
+  }
 }
 
 export async function fetchUsage(
@@ -203,19 +239,23 @@ export async function fetchUsage(
 
     let response: Response;
     try {
-      response = await withAbort(() => fetchFn(USAGE_URL, {
-        method: "GET", headers, redirect: "error", signal,
-      }), signal);
+      response = await withAbort(async () => {
+        const result = await fetchFn(USAGE_URL, {
+          method: "GET", headers, redirect: "error", signal,
+        });
+        // A non-cooperative transport can resolve after our caller has left.
+        if (signal.aborted) cancelBody(result);
+        return result;
+      }, signal);
+      signal.throwIfAborted();
     } catch {
       // Fetch/header validation errors can contain secret header values. Never echo them.
       throw failure("OpenAI usage network request failed");
     }
 
     if (!response.ok) {
-      try {
-        // Do not wait on a possibly stalled error body or expose its contents.
-        void response.body?.cancel().catch(() => {});
-      } catch { /* Best-effort body cleanup. */ }
+      // Do not wait on a possibly stalled error body or expose its contents.
+      cancelBody(response);
       if (response.status === 401 || response.status === 403) {
         throw new Error(`OpenAI usage request failed (HTTP ${response.status}): Authentication failed or insufficient permissions. Sign in with /login openai-codex or /login openai.`);
       }
@@ -227,12 +267,16 @@ export async function fetchUsage(
 
     let data: unknown;
     try {
-      data = await withAbort(() => response.json(), signal);
-    } catch {
-      throw failure("OpenAI usage request failed: Invalid JSON response");
+      data = await readUsageJson(response, signal);
+    } catch (error) {
+      throw failure(error instanceof ResponseTooLargeError
+        ? `OpenAI usage response exceeds ${MAX_USAGE_RESPONSE_BYTES} byte limit`
+        : "OpenAI usage request failed: Invalid JSON response");
     }
     return parseUsageResponse(data, credentials.account, (options?.now ?? Date.now)());
   } finally {
     clearTimeout(timer);
+    // Stop the underlying transport too, including on body-size/parse failures.
+    controller.abort();
   }
 }

@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   USAGE_URL,
+  MAX_USAGE_RESPONSE_BYTES,
   formatWindowDuration,
   parseUsageResponse,
   fetchUsage,
@@ -387,24 +388,20 @@ describe("fetchUsage", () => {
     );
   });
 
-  it("handles timeout during response body consumption", async () => {
-    const mockFetch: typeof globalThis.fetch = async () => {
-      return {
-        ok: true,
-        status: 200,
-        headers: new Headers(),
-        json: async () => {
-          // Simulate slow body read that exceeds timeout
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          return {};
-        },
-      } as unknown as Response;
+  it("cancels and unlocks a stalled response body on timeout without awaiting cancellation", async () => {
+    let cancelled = false;
+    let requestSignal: AbortSignal | null | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() { cancelled = true; return new Promise(() => {}); },
+    });
+    const mockFetch: typeof fetch = async (_url, options) => {
+      requestSignal = options?.signal;
+      return new Response(body);
     };
-
-    await assert.rejects(
-      async () => fetchUsage(credentials, { fetch: mockFetch, timeoutMs: 40 }),
-      /timed out after 40ms/i
-    );
+    await assert.rejects(fetchUsage(credentials, { fetch: mockFetch, timeoutMs: 40 }), /timed out after 40ms/i);
+    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
+    assert.equal(requestSignal?.aborted, true);
   });
 
   it("handles caller cancellation during fetch", async () => {
@@ -430,18 +427,9 @@ describe("fetchUsage", () => {
 
   it("handles caller cancellation during response body consumption", async () => {
     const controller = new AbortController();
-    const mockFetch: typeof globalThis.fetch = async () => {
-      return {
-        ok: true,
-        status: 200,
-        headers: new Headers(),
-        json: async () => {
-          // Simulate slow body read
-          await new Promise((resolve) => setTimeout(resolve, 300));
-          return {};
-        },
-      } as unknown as Response;
-    };
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+    const mockFetch: typeof fetch = async () => new Response(body);
 
     const promise = fetchUsage(credentials, {
       fetch: mockFetch,
@@ -452,5 +440,80 @@ describe("fetchUsage", () => {
     setTimeout(() => controller.abort(), 30);
 
     await assert.rejects(promise, /aborted/i);
+    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
+  });
+
+  it("accepts a valid JSON body at exactly the byte limit", async () => {
+    const json = JSON.stringify({ rate_limit: { primary_window: { used_percent: 25 } } });
+    const body = json + " ".repeat(MAX_USAGE_RESPONSE_BYTES - Buffer.byteLength(json));
+    const snapshot = await fetchUsage(credentials, { fetch: async () => new Response(body) });
+    assert.equal(snapshot.windows[0].remainingPercent, 75);
+  });
+
+  it("rejects oversized streams regardless of missing or misleading Content-Length", async () => {
+    for (const contentLength of [undefined, "1"]) {
+      let cancelled = false;
+      let requestSignal: AbortSignal | null | undefined;
+      let reads = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          reads++;
+          controller.enqueue(new Uint8Array(MAX_USAGE_RESPONSE_BYTES / 2 + 1));
+        },
+        cancel() { cancelled = true; },
+      });
+      await assert.rejects(fetchUsage(credentials, { fetch: async (_url, options) => {
+        requestSignal = options?.signal;
+        return new Response(body, { headers: contentLength ? { "Content-Length": contentLength } : {} });
+      } }), /response exceeds .* byte limit/);
+      assert.equal(cancelled, true);
+      assert.equal(body.locked, false);
+      assert.equal(requestSignal?.aborted, true);
+      assert.ok(reads <= 3, "must stop reading as soon as the byte limit is exceeded");
+    }
+  });
+
+  it("counts UTF-8 bytes rather than characters toward the response limit", async () => {
+    const json = JSON.stringify({ pad: "é".repeat(MAX_USAGE_RESPONSE_BYTES / 2), rate_limit: { primary_window: { used_percent: 25 } } });
+    assert.ok(json.length < MAX_USAGE_RESPONSE_BYTES);
+    await assert.rejects(fetchUsage(credentials, { fetch: async () => new Response(json) }), /byte limit/);
+  });
+
+  it("decodes UTF-8 characters split across chunks", async () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ plan_type: "équipe", rate_limit: { primary_window: { used_percent: 25 } } }));
+    let offset = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset === bytes.length) controller.close();
+        else controller.enqueue(bytes.subarray(offset, ++offset));
+      },
+    });
+    const result = await fetchUsage(credentials, { fetch: async () => new Response(body) });
+    assert.equal(result.plan, "équipe");
+    assert.equal(body.locked, false);
+  });
+
+  it("sanitizes JSON errors without exposing response contents", async () => {
+    await assert.rejects(fetchUsage(credentials, { fetch: async () => new Response("super-secret-token invalid JSON") }), (error: Error) => {
+      assert.match(error.message, /Invalid JSON response/);
+      assert.doesNotMatch(error.message, /super-secret-token/);
+      return true;
+    });
+  });
+
+  it("disposes a late response from a transport that ignored cancellation", async () => {
+    let finish!: (response: Response) => void;
+    const controller = new AbortController();
+    const pending = fetchUsage(credentials, {
+      fetch: () => new Promise<Response>((resolve) => { finish = resolve; }),
+      signal: controller.signal,
+    });
+    controller.abort();
+    await assert.rejects(pending, /aborted/);
+    let cancelled = false;
+    finish(new Response(new ReadableStream({ cancel() { cancelled = true; } })));
+    await Promise.resolve();
+    assert.equal(cancelled, true);
   });
 });
