@@ -23,6 +23,10 @@ function waitForRefresh(pending: Promise<UsageState>, signal?: AbortSignal): Pro
 
 const STATUS_KEY = "openai-usage";
 
+function isOpenAIModel(model?: { provider?: string }): boolean {
+  return model?.provider === "openai-codex" || model?.provider === "openai";
+}
+
 export default function openaiUsageExtension(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
   let unregisterPanel: (() => void) | undefined;
@@ -48,13 +52,17 @@ export default function openaiUsageExtension(pi: ExtensionAPI): void {
     }
     unregisterPanel?.();
     unregisterPanel = registerUsagePanel((width) => renderUsagePanel(monitor.getState(), width, context?.ui.theme));
-    monitor.start();
+    if (isOpenAIModel(ctx.model)) {
+      monitor.start();
+    } else {
+      monitor.start(false);
+    }
   });
 
   pi.on("turn_end", (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     context = ctx;
-    if (ctx.model?.provider === "openai-codex" || ctx.model?.provider === "openai") {
+    if (isOpenAIModel(ctx.model)) {
       void monitor.refresh();
     }
   });
@@ -62,8 +70,11 @@ export default function openaiUsageExtension(pi: ExtensionAPI): void {
   pi.on("model_select", (event, ctx) => {
     if (ctx.mode !== "tui") return;
     context = ctx;
-    if (event.model.provider === "openai-codex" || event.model.provider === "openai") {
+    if (isOpenAIModel(event.model)) {
+      monitor.start();
       void monitor.refresh();
+    } else {
+      monitor.start(false);
     }
   });
 

@@ -205,3 +205,43 @@ test("invalid command arguments and non-TUI footer requests are handled", async 
   assert.match(h.notices[0]!, /Usage: \/openai-usage/);
   assert.match(h.notices[1]!, /interactive TUI/);
 });
+
+test("sidebar usage only refreshes when using an openai model", async () => {
+  let requests = 0;
+  const mockFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => { requests++; return mockFetch(...args); };
+  const h = harness();
+  h.ctx.model = { provider: "antigravity" };
+
+  // session_start with non-openai model must not trigger usage fetch
+  h.events.get("session_start")!({}, h.ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(requests, 0);
+
+  // turn_end with non-openai model must not trigger usage fetch
+  h.events.get("turn_end")!({}, h.ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(requests, 0);
+
+  // model_select to another non-openai model must not trigger usage fetch
+  h.events.get("model_select")!({ model: { provider: "anthropic" } }, h.ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(requests, 0);
+
+  // model_select to openai model refreshes usage
+  h.events.get("model_select")!({ model: { provider: "openai" } }, h.ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(requests, 1);
+
+  // model_select to non-openai model stops polling and does not refresh
+  h.events.get("model_select")!({ model: { provider: "antigravity" } }, h.ctx);
+  h.ctx.model = { provider: "antigravity" };
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(requests, 1);
+
+  // subsequent turn_end with non-openai model does not refresh
+  h.events.get("turn_end")!({}, h.ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(requests, 1);
+});
+
