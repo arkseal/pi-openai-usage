@@ -56,6 +56,7 @@ export default function openaiUsageExtension(pi: ExtensionAPI): void {
       monitor.start();
     } else {
       monitor.start(false);
+      void monitor.refresh();
     }
   });
 
